@@ -29,7 +29,7 @@ const CONFIG = {
     port: Number(process.env.PG_PORT || 5432),
     database: process.env.PG_DATABASE || "benchmark_db",
     user: process.env.PG_USER || "srinath",
-    password: process.env.PG_PASSWORD || undefined,
+    password: process.env.PG_PASSWORD || "Chill@123",
     max: Number(process.env.PG_POOL_MAX || 10),
     idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30_000),
     connectionTimeoutMillis: Number(process.env.PG_CONN_TIMEOUT_MS || 10_000),
@@ -38,131 +38,74 @@ const CONFIG = {
     host: process.env.MONGO_HOST || "18.234.225.241",
     port: Number(process.env.MONGO_PORT || 27017),
     db: process.env.MONGO_DB || "benchmark_db",
-    collection: process.env.MONGO_COLLECTION || "orders",
   },
 };
 
-const CSV_HEADER_MAP = {
-  index: "index",
-  "Order ID": "orderId",
-  Date: "date",
-  Status: "status",
-  Fulfilment: "fulfilment",
-  "Sales Channel": "salesChannel",
-  "ship-service-level": "shipServiceLevel",
-  Style: "style",
-  SKU: "sku",
-  Category: "category",
-  Size: "size",
-  ASIN: "asin",
-  "Courier Status": "courierStatus",
-  Qty: "qty",
-  currency: "currency",
-  Amount: "amount",
-  "ship-city": "shipCity",
-  "ship-state": "shipState",
-  "ship-postal-code": "shipPostalCode",
-  "ship-country": "shipCountry",
-  "promotion-ids": "promotionIds",
-  B2B: "b2b",
-  "fulfilled-by": "fulfilledBy",
-  "Unnamed: 22": "unnamed22",
-};
-
-function parseDate(value) {
-  if (!value) return null;
-  // Try ISO first, then fall back to Date parsing. If invalid, store null and keep raw in Mongo.
-  const d = new Date(value);
-  // eslint-disable-next-line no-restricted-globals
-  if (isNaN(d.getTime())) return null;
-  return d;
+function quotePgIdent(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
 }
 
-function parseIntOrNull(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const n = Number.parseInt(String(value), 10);
-  return Number.isFinite(n) ? n : null;
+function sanitizeIdentifier(value, fallbackPrefix) {
+  const lower = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const withFallback = lower || fallbackPrefix;
+  if (/^[0-9]/.test(withFallback)) return `${fallbackPrefix}_${withFallback}`;
+  return withFallback;
 }
 
-function parseFloatOrNull(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const cleaned = String(value).replace(/,/g, "");
-  const n = Number.parseFloat(cleaned);
-  return Number.isFinite(n) ? n : null;
+function sanitizePostgresColumnName(header, index) {
+  return sanitizeIdentifier(header, `col_${index + 1}`);
 }
 
-function parseBoolOrNull(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const v = String(value).trim().toLowerCase();
-  if (["true", "t", "1", "yes", "y"].includes(v)) return true;
-  if (["false", "f", "0", "no", "n"].includes(v)) return false;
-  return null;
+function sanitizeResourceName(name, fallbackPrefix) {
+  return sanitizeIdentifier(name, fallbackPrefix);
 }
 
-function normalizeRow(raw) {
-  const out = {};
-  for (const [csvKey, outKey] of Object.entries(CSV_HEADER_MAP)) {
-    out[outKey] = raw[csvKey];
-  }
-
-  // Type-normalized fields (kept in both DBs)
-  return {
-    index: parseIntOrNull(out.index),
-    orderId: out.orderId || null,
-    date: parseDate(out.date),
-    status: out.status || null,
-    fulfilment: out.fulfilment || null,
-    salesChannel: out.salesChannel || null,
-    shipServiceLevel: out.shipServiceLevel || null,
-    style: out.style || null,
-    sku: out.sku || null,
-    category: out.category || null,
-    size: out.size || null,
-    asin: out.asin || null,
-    courierStatus: out.courierStatus || null,
-    qty: parseIntOrNull(out.qty),
-    currency: out.currency || null,
-    amount: parseFloatOrNull(out.amount),
-    shipCity: out.shipCity || null,
-    shipState: out.shipState || null,
-    shipPostalCode: out.shipPostalCode || null,
-    shipCountry: out.shipCountry || null,
-    promotionIds: out.promotionIds || null,
-    b2b: parseBoolOrNull(out.b2b),
-    fulfilledBy: out.fulfilledBy || null,
-    unnamed22: out.unnamed22 || null,
-    _raw: raw, // preserve exact raw CSV row for Mongo analysis/auditing
-  };
+function buildUniquePostgresColumns(csvHeaders) {
+  const used = new Set();
+  return csvHeaders.map((header, idx) => {
+    const base = sanitizePostgresColumnName(header, idx);
+    let candidate = base;
+    let n = 2;
+    while (used.has(candidate)) {
+      candidate = `${base}_${n}`;
+      n += 1;
+    }
+    used.add(candidate);
+    return candidate;
+  });
 }
 
-function toPostgresRow(doc) {
-  // Relational schema mapping (flat, typed)
-  return {
-    index: doc.index,
-    order_id: doc.orderId,
-    order_date: doc.date ? doc.date.toISOString().slice(0, 10) : null, // date-only
-    status: doc.status,
-    fulfilment: doc.fulfilment,
-    sales_channel: doc.salesChannel,
-    ship_service_level: doc.shipServiceLevel,
-    style: doc.style,
-    sku: doc.sku,
-    category: doc.category,
-    size: doc.size,
-    asin: doc.asin,
-    courier_status: doc.courierStatus,
-    qty: doc.qty,
-    currency: doc.currency,
-    amount: doc.amount,
-    ship_city: doc.shipCity,
-    ship_state: doc.shipState,
-    ship_postal_code: doc.shipPostalCode,
-    ship_country: doc.shipCountry,
-    promotion_ids: doc.promotionIds,
-    b2b: doc.b2b,
-    fulfilled_by: doc.fulfilledBy,
-    unnamed_22: doc.unnamed22,
-  };
+async function detectCsvHeaders(inputCsvPath) {
+  return new Promise((resolve, reject) => {
+    const input = fs.createReadStream(inputCsvPath);
+    const parser = csv({
+      skipLines: 0,
+      mapHeaders: ({ header }) => (header ? header.trim() : header),
+    });
+
+    let settled = false;
+    const finish = (fn) => (arg) => {
+      if (settled) return;
+      settled = true;
+      input.destroy();
+      parser.destroy();
+      fn(arg);
+    };
+
+    parser.on("headers", finish(resolve));
+    parser.on("error", finish(reject));
+    input.on("error", finish(reject));
+    parser.on(
+      "end",
+      finish(() => reject(new Error("CSV file has no header row."))),
+    );
+
+    input.pipe(parser);
+  });
 }
 
 function escapeCsv(value) {
@@ -189,92 +132,36 @@ function ensureResultsHeader(resultsPath) {
   fs.writeFileSync(resultsPath, header, "utf8");
 }
 
-async function ensurePostgresSchema(pool) {
-  const ddl = `
-    CREATE TABLE IF NOT EXISTS orders (
-      id BIGSERIAL PRIMARY KEY,
-      "index" INTEGER NULL,
-      order_id TEXT NULL,
-      order_date DATE NULL,
-      status TEXT NULL,
-      fulfilment TEXT NULL,
-      sales_channel TEXT NULL,
-      ship_service_level TEXT NULL,
-      style TEXT NULL,
-      sku TEXT NULL,
-      category TEXT NULL,
-      size TEXT NULL,
-      asin TEXT NULL,
-      courier_status TEXT NULL,
-      qty INTEGER NULL,
-      currency TEXT NULL,
-      amount NUMERIC NULL,
-      ship_city TEXT NULL,
-      ship_state TEXT NULL,
-      ship_postal_code TEXT NULL,
-      ship_country TEXT NULL,
-      promotion_ids TEXT NULL,
-      b2b BOOLEAN NULL,
-      fulfilled_by TEXT NULL,
-      unnamed_22 TEXT NULL
-    );
-  `;
-  await pool.query(ddl);
+async function ensurePostgresSchema(pool, tableName, pgColumns) {
+  const quotedTable = quotePgIdent(tableName);
+  const colsDDL = pgColumns.map((c) => `${quotePgIdent(c)} TEXT`).join(", ");
+  await pool.query(`DROP TABLE IF EXISTS ${quotedTable};`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS ${quotedTable} (${colsDDL});`);
 }
 
-async function insertChunkPostgres(pool, pgRows) {
-  if (pgRows.length === 0) return;
-
-  const cols = [
-    "index",
-    "order_id",
-    "order_date",
-    "status",
-    "fulfilment",
-    "sales_channel",
-    "ship_service_level",
-    "style",
-    "sku",
-    "category",
-    "size",
-    "asin",
-    "courier_status",
-    "qty",
-    "currency",
-    "amount",
-    "ship_city",
-    "ship_state",
-    "ship_postal_code",
-    "ship_country",
-    "promotion_ids",
-    "b2b",
-    "fulfilled_by",
-    "unnamed_22",
-  ];
-
+async function insertChunkPostgres(pool, tableName, pgColumns, csvHeaders, docsChunk) {
+  if (docsChunk.length === 0) return;
   const values = [];
   const placeholders = [];
   let p = 1;
-  for (const r of pgRows) {
+  for (const doc of docsChunk) {
     const rowPlaceholders = [];
-    for (const c of cols) {
-      values.push(r[c]);
+    for (const header of csvHeaders) {
+      values.push(doc[header] ?? null);
       rowPlaceholders.push(`$${p++}`);
     }
     placeholders.push(`(${rowPlaceholders.join(",")})`);
   }
 
-  const sql = `INSERT INTO orders (${cols.map((c) => `"${c}"`).join(",")}) VALUES ${placeholders.join(",")};`;
+  const sql = `INSERT INTO ${quotePgIdent(tableName)} (${pgColumns.map((c) => quotePgIdent(c)).join(",")}) VALUES ${placeholders.join(",")};`;
   await pool.query(sql, values);
 }
 
 async function ensureMongoSchema(mongoCollection) {
-  // Ensure an index helpful for typical analyses (optional, harmless if exists)
-  // Not required for correctness; keep minimal.
   try {
-    await mongoCollection.createIndex({ orderId: 1 });
-  } catch {
-    // ignore index errors (permissions, etc.)
+    await mongoCollection.drop();
+  } catch (err) {
+    if (err?.codeName !== "NamespaceNotFound") throw err;
   }
 }
 
@@ -292,6 +179,16 @@ async function main() {
   }
 
   ensureResultsHeader(CONFIG.resultsPath);
+
+  const csvHeaders = await detectCsvHeaders(inputCsvPath);
+  if (!Array.isArray(csvHeaders) || csvHeaders.length === 0) {
+    throw new Error("CSV file has no headers; cannot build dynamic schema.");
+  }
+
+  const csvBaseName = path.basename(inputCsvPath, path.extname(inputCsvPath));
+  const tableName = sanitizeResourceName(csvBaseName, "dataset");
+  const collectionName = sanitizeResourceName(csvBaseName, "dataset");
+  const pgColumns = buildUniquePostgresColumns(csvHeaders);
 
   const pool = new Pool(CONFIG.postgres);
 
@@ -322,12 +219,13 @@ async function main() {
     shutdown("Received SIGTERM, closing connections...").finally(() => process.exit(143));
   });
 
-  await ensurePostgresSchema(pool);
+  await ensurePostgresSchema(pool, tableName, pgColumns);
   await mongoClient.connect();
   const mongoDb = mongoClient.db(CONFIG.mongo.db);
-  const mongoCollection = mongoDb.collection(CONFIG.mongo.collection);
+  const mongoCollection = mongoDb.collection(collectionName);
   await ensureMongoSchema(mongoCollection);
 
+  // Start benchmark timing only after DB objects are reset/created.
   const overallStart = performance.now();
 
   let buffer = [];
@@ -371,15 +269,13 @@ async function main() {
     const thisChunkIndex = ++chunkIndex;
     const chunkRecords = docsChunk.length;
 
-    const pgRows = docsChunk.map(toPostgresRow);
-
     let pgMs = 0;
     let mongoMs = 0;
 
     // Postgres timing
     try {
       const t0 = performance.now();
-      await insertChunkPostgres(pool, pgRows);
+      await insertChunkPostgres(pool, tableName, pgColumns, csvHeaders, docsChunk);
       const t1 = performance.now();
       pgMs = t1 - t0;
       pgTotalMs += pgMs;
@@ -424,7 +320,7 @@ async function main() {
     csvStream.on("data", async (rawRow) => {
       csvStream.pause();
       try {
-        buffer.push(normalizeRow(rawRow));
+        buffer.push(rawRow);
         if (buffer.length >= CONFIG.chunkSize) {
           const chunk = buffer;
           buffer = [];
@@ -470,8 +366,15 @@ async function main() {
   });
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err?.stack || err);
-  process.exitCode = 1;
-});
+// Allow other scripts to import CONFIG without accidentally running this benchmark.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Fatal error:", err?.stack || err);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  CONFIG,
+};
 
