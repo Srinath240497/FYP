@@ -1,18 +1,3 @@
-/**
- * Dual-insertion benchmark: PostgreSQL (pg) vs MongoDB (mongodb)
- * - Streams CSV (no full-file load)
- * - Batches rows into chunks of 1000
- * - Times Postgres insert then Mongo insert per chunk
- * - Appends per-chunk metrics to benchmark_results.csv
- *
- * Usage:
- *   node index.js /path/to/dataset.csv
- *
- * Env (optional):
- *   PG_HOST, PG_PORT, PG_DATABASE, PG_USER, PG_PASSWORD
- *   MONGO_HOST, MONGO_PORT, MONGO_DB, MONGO_COLLECTION
- */
-
 const fs = require("fs");
 const path = require("path");
 const csv = require("csv-parser");
@@ -35,7 +20,7 @@ const CONFIG = {
     connectionTimeoutMillis: Number(process.env.PG_CONN_TIMEOUT_MS || 10_000),
   },
   mongo: {
-    host: process.env.MONGO_HOST || "18.234.225.241",
+    host: process.env.MONGO_HOST || "13.50.245.233",
     port: Number(process.env.MONGO_PORT || 27017),
     db: process.env.MONGO_DB || "benchmark_db",
   },
