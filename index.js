@@ -30,6 +30,7 @@ function quotePgIdent(identifier) {
   return `"${String(identifier).replace(/"/g, '""')}"`;
 }
 
+// To create a valid database identifier
 function sanitizeIdentifier(value, fallbackPrefix) {
   const lower = String(value || "")
     .trim()
@@ -66,6 +67,7 @@ function buildUniquePostgresColumns(csvHeaders) {
 
 async function detectCsvHeaders(inputCsvPath) {
   return new Promise((resolve, reject) => {
+    // To create a read stream from the input CSV file
     const input = fs.createReadStream(inputCsvPath);
     const parser = csv({
       skipLines: 0,
@@ -163,20 +165,25 @@ async function main() {
     return;
   }
 
+  // To check if the file exists, if not, create it
   ensureResultsHeader(CONFIG.resultsPath);
 
+  // To detect the CSV headers
   const csvHeaders = await detectCsvHeaders(inputCsvPath);
   if (!Array.isArray(csvHeaders) || csvHeaders.length === 0) {
     throw new Error("CSV file has no headers; cannot build dynamic schema.");
   }
 
+  // To get the valid identifier of the CSV file
   const csvBaseName = path.basename(inputCsvPath, path.extname(inputCsvPath));
   const tableName = sanitizeResourceName(csvBaseName, "dataset");
   const collectionName = sanitizeResourceName(csvBaseName, "dataset");
   const pgColumns = buildUniquePostgresColumns(csvHeaders);
 
+  // To initialize the PostgreSQL connection pool
   const pool = new Pool(CONFIG.postgres);
 
+  // To initialize the MongoDB connection
   const mongoUri = `mongodb://${CONFIG.mongo.host}:${CONFIG.mongo.port}`;
   const mongoClient = new MongoClient(mongoUri, {
     // keep defaults; you can tune later for research
@@ -184,6 +191,7 @@ async function main() {
     serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 10_000),
   });
 
+  // To handle the shutdown of the connections
   let shuttingDown = false;
   const shutdown = async (reason) => {
     if (shuttingDown) return;
@@ -210,7 +218,7 @@ async function main() {
   const mongoCollection = mongoDb.collection(collectionName);
   await ensureMongoSchema(mongoCollection);
 
-  // Start benchmark timing only after DB objects are reset/created.
+  // To start the benchmark timing
   const overallStart = performance.now();
 
   let buffer = [];
