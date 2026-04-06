@@ -1,0 +1,187 @@
+{
+  "generatedAt": "2026-04-05T09:00:08.560Z",
+  "researchQuestion": "Reliability thresholds: concurrency at first error and at >1% error rate",
+  "env": {
+    "pgHost": "44.221.64.221",
+    "mongoHost": "34.204.194.81"
+  },
+  "stressLadder": [
+    100,
+    200,
+    400,
+    600,
+    800,
+    1000
+  ],
+  "degradationThresholdPercent": 1,
+  "postgres": {
+    "table": "cloud_warehouse_compersion_chart",
+    "firstErrorAtConcurrency": null,
+    "firstDegradationAtConcurrency": null,
+    "batches": [
+      {
+        "concurrency": 100,
+        "wallTimeMs": 1368.960875,
+        "successCount": 100,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      },
+      {
+        "concurrency": 200,
+        "wallTimeMs": 1986.0671250000005,
+        "successCount": 200,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      },
+      {
+        "concurrency": 400,
+        "wallTimeMs": 3870.683583,
+        "successCount": 400,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      },
+      {
+        "concurrency": 600,
+        "wallTimeMs": 5758.6327919999985,
+        "successCount": 600,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      },
+      {
+        "concurrency": 800,
+        "wallTimeMs": 7673.964125000002,
+        "successCount": 800,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      },
+      {
+        "concurrency": 1000,
+        "wallTimeMs": 9621.855,
+        "successCount": 1000,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      }
+    ]
+  },
+  "mongodb": {
+    "collection": "cloud_warehouse_compersion_chart",
+    "firstErrorAtConcurrency": null,
+    "firstDegradationAtConcurrency": null,
+    "batches": [
+      {
+        "concurrency": 100,
+        "wallTimeMs": 1472.0052910000002,
+        "successCount": 100,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      },
+      {
+        "concurrency": 200,
+        "wallTimeMs": 1127.0608750000001,
+        "successCount": 200,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      },
+      {
+        "concurrency": 400,
+        "wallTimeMs": 2008.0347500000007,
+        "successCount": 400,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      },
+      {
+        "concurrency": 600,
+        "wallTimeMs": 2942.332125000001,
+        "successCount": 600,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      },
+      {
+        "concurrency": 800,
+        "wallTimeMs": 3888.322082999999,
+        "successCount": 800,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      },
+      {
+        "concurrency": 1000,
+        "wallTimeMs": 4870.650709000001,
+        "successCount": 1000,
+        "errorCount": 0,
+        "errorRatePercent": 0,
+        "categoryCounts": {
+          "Timeout": 0,
+          "Deadlock": 0,
+          "Connection Refused": 0,
+          "Other": 0
+        }
+      }
+    ]
+  }
+}

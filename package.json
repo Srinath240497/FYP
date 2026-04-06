@@ -11,6 +11,7 @@
   "description": "",
   "dependencies": {
     "csv-parser": "^3.2.0",
+    "dotenv": "^17.3.1",
     "mongodb": "^7.1.0",
     "pg": "^8.20.0"
   },
