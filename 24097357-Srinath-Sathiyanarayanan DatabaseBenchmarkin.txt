@@ -1,0 +1,1669 @@
+// index.js – High Velocity Data Pipeline & Schema Provisioning
+const fs = require("fs");
+const path = require("path");
+const csv = require("csv-parser");
+const { Pool } = require("pg");
+const { MongoClient } = require("mongodb");
+const { performance } = require("perf_hooks");
+
+const CONFIG = {
+  chunkSize: Number(process.env.CHUNK_SIZE || 1000),
+  progressEveryRecords: Number(process.env.PROGRESS_EVERY || 10000),
+  resultsPath: process.env.RESULTS_PATH || path.resolve(process.cwd(), "benchmark_results.csv"),
+  postgres: {
+    host: process.env.PG_HOST || "44.221.64.221",
+    port: Number(process.env.PG_PORT || 5432),
+    database: process.env.PG_DATABASE || "benchmark_db",
+    user: process.env.PG_USER || "postgres",
+    password: process.env.PG_PASSWORD || "Chill@123",
+    max: Number(process.env.PG_POOL_MAX || 10),
+    idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30_000),
+    connectionTimeoutMillis: Number(process.env.PG_CONN_TIMEOUT_MS || 10_000),
+  },
+  mongo: {
+    host: process.env.MONGO_HOST || "34.204.194.81",
+    port: Number(process.env.MONGO_PORT || 27017),
+    db: process.env.MONGO_DB || "benchmark_db",
+  },
+};
+
+function quotePgIdent(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
+// To create a valid database identifier
+function sanitizeIdentifier(value, fallbackPrefix) {
+  const lower = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const withFallback = lower || fallbackPrefix;
+  if (/^[0-9]/.test(withFallback)) return `${fallbackPrefix}_${withFallback}`;
+  return withFallback;
+}
+
+function sanitizePostgresColumnName(header, index) {
+  return sanitizeIdentifier(header, `col_${index + 1}`);
+}
+
+function sanitizeResourceName(name, fallbackPrefix) {
+  return sanitizeIdentifier(name, fallbackPrefix);
+}
+
+function buildUniquePostgresColumns(csvHeaders) {
+  const used = new Set();
+  return csvHeaders.map((header, idx) => {
+    const base = sanitizePostgresColumnName(header, idx);
+    let candidate = base;
+    let n = 2;
+    while (used.has(candidate)) {
+      candidate = `${base}_${n}`;
+      n += 1;
+    }
+    used.add(candidate);
+    return candidate;
+  });
+}
+
+async function detectCsvHeaders(inputCsvPath) {
+  return new Promise((resolve, reject) => {
+    // To create a read stream from the input CSV file
+    const input = fs.createReadStream(inputCsvPath);
+    const parser = csv({
+      skipLines: 0,
+      mapHeaders: ({ header }) => (header ? header.trim() : header),
+    });
+
+    let settled = false;
+    const finish = (fn) => (arg) => {
+      if (settled) return;
+      settled = true;
+      input.destroy();
+      parser.destroy();
+      fn(arg);
+    };
+
+    parser.on("headers", finish(resolve));
+    parser.on("error", finish(reject));
+    input.on("error", finish(reject));
+    parser.on(
+      "end",
+      finish(() => reject(new Error("CSV file has no header row."))),
+    );
+
+    input.pipe(parser);
+  });
+}
+
+function escapeCsv(value) {
+  const s = value === null || value === undefined ? "" : String(value);
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function ensureResultsHeader(resultsPath) {
+  if (fs.existsSync(resultsPath)) return;
+  const header =
+    [
+      "timestamp",
+      "chunk_index",
+      "chunk_records",
+      "total_processed",
+      "pg_ms",
+      "mongo_ms",
+      "pg_errors",
+      "mongo_errors",
+      "pg_avg_ms_per_record_chunk",
+      "mongo_avg_ms_per_record_chunk",
+    ].join(",") + "\n";
+  fs.writeFileSync(resultsPath, header, "utf8");
+}
+
+async function ensurePostgresSchema(pool, tableName, pgColumns) {
+  const quotedTable = quotePgIdent(tableName);
+  const colsDDL = pgColumns.map((c) => `${quotePgIdent(c)} TEXT`).join(", ");
+  await pool.query(`DROP TABLE IF EXISTS ${quotedTable};`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS ${quotedTable} (${colsDDL});`);
+}
+
+async function insertChunkPostgres(pool, tableName, pgColumns, csvHeaders, docsChunk) {
+  if (docsChunk.length === 0) return;
+  const values = [];
+  const placeholders = [];
+  let p = 1;
+  for (const doc of docsChunk) {
+    const rowPlaceholders = [];
+    for (const header of csvHeaders) {
+      values.push(doc[header] ?? null);
+      rowPlaceholders.push(`$${p++}`);
+    }
+    placeholders.push(`(${rowPlaceholders.join(",")})`);
+  }
+
+  const sql = `INSERT INTO ${quotePgIdent(tableName)} (${pgColumns.map((c) => quotePgIdent(c)).join(",")}) VALUES ${placeholders.join(",")};`;
+  await pool.query(sql, values);
+}
+
+async function ensureMongoSchema(mongoCollection) {
+  try {
+    await mongoCollection.drop();
+  } catch (err) {
+    if (err?.codeName !== "NamespaceNotFound") throw err;
+  }
+}
+
+async function insertChunkMongo(mongoCollection, docs) {
+  if (docs.length === 0) return;
+  await mongoCollection.insertMany(docs, { ordered: false });
+}
+
+async function main() {
+  const inputCsvPath = process.argv[2];
+  if (!inputCsvPath) {
+    console.error("Usage: node index.js /path/to/dataset.csv");
+    process.exitCode = 2;
+    return;
+  }
+
+  // To check if the file exists, if not, create it
+  ensureResultsHeader(CONFIG.resultsPath);
+
+  // To detect the CSV headers
+  const csvHeaders = await detectCsvHeaders(inputCsvPath);
+  if (!Array.isArray(csvHeaders) || csvHeaders.length === 0) {
+    throw new Error("CSV file has no headers; cannot build dynamic schema.");
+  }
+
+  // To get the valid identifier of the CSV file
+  const csvBaseName = path.basename(inputCsvPath, path.extname(inputCsvPath));
+  const tableName = sanitizeResourceName(csvBaseName, "dataset");
+  const collectionName = sanitizeResourceName(csvBaseName, "dataset");
+  const pgColumns = buildUniquePostgresColumns(csvHeaders);
+
+  // To initialize the PostgreSQL connection pool
+  const pool = new Pool(CONFIG.postgres);
+
+  // To initialize the MongoDB connection
+  const mongoUri = `mongodb://${CONFIG.mongo.host}:${CONFIG.mongo.port}`;
+  const mongoClient = new MongoClient(mongoUri, {
+    // keep defaults; you can tune later for research
+    maxPoolSize: Number(process.env.MONGO_POOL_MAX || 20),
+    serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 10_000),
+  });
+
+  // To handle the shutdown of the connections
+  let shuttingDown = false;
+  const shutdown = async (reason) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (reason) console.error(reason);
+    try {
+      await pool.end();
+    } catch {}
+    try {
+      await mongoClient.close();
+    } catch {}
+  };
+
+  process.on("SIGINT", () => {
+    shutdown("Received SIGINT, closing connections...").finally(() => process.exit(130));
+  });
+  process.on("SIGTERM", () => {
+    shutdown("Received SIGTERM, closing connections...").finally(() => process.exit(143));
+  });
+
+  await ensurePostgresSchema(pool, tableName, pgColumns);
+  await mongoClient.connect();
+  const mongoDb = mongoClient.db(CONFIG.mongo.db);
+  const mongoCollection = mongoDb.collection(collectionName);
+  await ensureMongoSchema(mongoCollection);
+
+  // To start the benchmark timing
+  const overallStart = performance.now();
+
+  let buffer = [];
+  let chunkIndex = 0;
+  let totalProcessed = 0;
+  let pgErrors = 0;
+  let mongoErrors = 0;
+  let pgTotalMs = 0;
+  let mongoTotalMs = 0;
+
+  const inputStream = fs.createReadStream(inputCsvPath);
+  const parser = csv({
+    // csv-parser uses the first line as headers automatically; we keep them as-is.
+    skipLines: 0,
+    mapHeaders: ({ header }) => (header ? header.trim() : header),
+  });
+
+  const csvStream = inputStream.pipe(parser);
+
+  const appendResultLine = (lineObj) => {
+    const line =
+      [
+        lineObj.timestamp,
+        lineObj.chunk_index,
+        lineObj.chunk_records,
+        lineObj.total_processed,
+        lineObj.pg_ms,
+        lineObj.mongo_ms,
+        lineObj.pg_errors,
+        lineObj.mongo_errors,
+        lineObj.pg_avg_ms_per_record_chunk,
+        lineObj.mongo_avg_ms_per_record_chunk,
+      ]
+        .map(escapeCsv)
+        .join(",") + "\n";
+    fs.appendFileSync(CONFIG.resultsPath, line, "utf8");
+  };
+
+  const processChunk = async (docsChunk) => {
+    const ts = new Date().toISOString();
+    const thisChunkIndex = ++chunkIndex;
+    const chunkRecords = docsChunk.length;
+
+    let pgMs = 0;
+    let mongoMs = 0;
+
+    // Postgres timing
+    try {
+      const t0 = performance.now();
+      await insertChunkPostgres(pool, tableName, pgColumns, csvHeaders, docsChunk);
+      const t1 = performance.now();
+      pgMs = t1 - t0;
+      pgTotalMs += pgMs;
+    } catch (err) {
+      pgErrors += 1;
+      console.error(`[Chunk ${thisChunkIndex}] Postgres insert error:`, err?.message || err);
+    }
+
+    // Mongo timing
+    try {
+      const t0 = performance.now();
+      await insertChunkMongo(mongoCollection, docsChunk);
+      const t1 = performance.now();
+      mongoMs = t1 - t0;
+      mongoTotalMs += mongoMs;
+    } catch (err) {
+      mongoErrors += 1;
+      console.error(`[Chunk ${thisChunkIndex}] Mongo insert error:`, err?.message || err);
+    }
+
+    totalProcessed += chunkRecords;
+
+    appendResultLine({
+      timestamp: ts,
+      chunk_index: thisChunkIndex,
+      chunk_records: chunkRecords,
+      total_processed: totalProcessed,
+      pg_ms: pgMs.toFixed(3),
+      mongo_ms: mongoMs.toFixed(3),
+      pg_errors: pgErrors,
+      mongo_errors: mongoErrors,
+      pg_avg_ms_per_record_chunk: chunkRecords ? (pgMs / chunkRecords).toFixed(6) : "",
+      mongo_avg_ms_per_record_chunk: chunkRecords ? (mongoMs / chunkRecords).toFixed(6) : "",
+    });
+
+    if (totalProcessed % CONFIG.progressEveryRecords === 0) {
+      console.log(`Processed ${totalProcessed.toLocaleString()} records...`);
+    }
+  };
+
+  return new Promise((resolve, reject) => {
+    csvStream.on("data", async (rawRow) => {
+      csvStream.pause();
+      try {
+        buffer.push(rawRow);
+        if (buffer.length >= CONFIG.chunkSize) {
+          const chunk = buffer;
+          buffer = [];
+          await processChunk(chunk);
+        }
+        csvStream.resume();
+      } catch (err) {
+        csvStream.destroy(err);
+      }
+    });
+
+    csvStream.on("end", async () => {
+      try {
+        if (buffer.length > 0) {
+          await processChunk(buffer);
+          buffer = [];
+        }
+
+        const overallEnd = performance.now();
+        const totalMs = overallEnd - overallStart;
+
+        const pgAvg = totalProcessed ? pgTotalMs / totalProcessed : 0;
+        const mongoAvg = totalProcessed ? mongoTotalMs / totalProcessed : 0;
+
+        console.log("Benchmark complete.");
+        console.log(`Total records: ${totalProcessed.toLocaleString()}`);
+        console.log(`Total wall time: ${totalMs.toFixed(2)} ms`);
+        console.log(`Postgres total insert time: ${pgTotalMs.toFixed(2)} ms (avg ${pgAvg.toFixed(6)} ms/record), errors: ${pgErrors}`);
+        console.log(`Mongo total insert time: ${mongoTotalMs.toFixed(2)} ms (avg ${mongoAvg.toFixed(6)} ms/record), errors: ${mongoErrors}`);
+
+        await shutdown();
+        resolve();
+      } catch (err) {
+        await shutdown(err);
+        reject(err);
+      }
+    });
+
+    csvStream.on("error", async (err) => {
+      await shutdown(err);
+      reject(err);
+    });
+  });
+}
+
+// Allow other scripts to import CONFIG without accidentally running this benchmark.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Fatal error:", err?.stack || err);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  CONFIG,
+};
+
+
+// reliability_test.js – Database Stability & Fault Tolerance Module
+/**
+ * Reliability threshold test: concurrent reads with error categorization.
+ *
+ * Loads DB endpoints from .env via dotenv (PG_HOST, MONGO_HOST, etc.).
+ * Stress ladder: fixed concurrency levels per batch.
+ * Uses Promise.allSettled + per-query try/catch so one failure does not abort the batch.
+ */
+
+const fs = require("fs");
+const path = require("path");
+const { performance } = require("perf_hooks");
+const { Pool } = require("pg");
+const { MongoClient } = require("mongodb");
+
+require("dotenv").config({ path: path.resolve(process.cwd(), ".env") });
+// CONFIG must be required after dotenv so process.env is populated.
+const { CONFIG } = require("./index.js");
+
+const STRESS_LADDER = [100, 200, 400, 600, 800, 1000];
+const DEGRADATION_THRESHOLD_PERCENT = 1;
+const REPORT_PATH = path.resolve(process.cwd(), "reliability_report.json");
+
+function getArgValue(flagName, defaultValue) {
+  const argv = process.argv.slice(2);
+  const asEq = argv.find((a) => a.startsWith(`${flagName}=`));
+  if (asEq) return asEq.slice(flagName.length + 1);
+  const idx = argv.indexOf(flagName);
+  if (idx !== -1 && idx + 1 < argv.length) return argv[idx + 1];
+  return defaultValue;
+}
+
+function sanitizeIdentifier(value, fallbackPrefix) {
+  const lower = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const withFallback = lower || fallbackPrefix;
+  if (/^[0-9]/.test(withFallback)) return `${fallbackPrefix}_${withFallback}`;
+  return withFallback;
+}
+
+function sanitizeResourceName(name, fallbackPrefix) {
+  return sanitizeIdentifier(name, fallbackPrefix);
+}
+
+function quotePgIdent(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
+/**
+ * @param {unknown} err
+ * @returns {'Timeout' | 'Deadlock' | 'Connection Refused' | 'Other'}
+ */
+function categorizeError(err) {
+  const msg = String(
+    err && typeof err === "object" && "message" in err ? err.message : err,
+  ).toLowerCase();
+  const code = err && typeof err === "object" && "code" in err ? err.code : undefined;
+  const codeStr = code !== undefined && code !== null ? String(code) : "";
+
+  if (
+    code === "ECONNREFUSED" ||
+    msg.includes("connection refused") ||
+    msg.includes("connect econnrefused")
+  ) {
+    return "Connection Refused";
+  }
+
+  if (
+    code === "ETIMEDOUT" ||
+    code === "ESOCKETTIMEDOUT" ||
+    codeStr === "57014" ||
+    msg.includes("timeout") ||
+    msg.includes("timed out") ||
+    msg.includes("server selection timed out")
+  ) {
+    return "Timeout";
+  }
+
+  if (codeStr === "40P01" || msg.includes("deadlock")) {
+    return "Deadlock";
+  }
+
+  return "Other";
+}
+
+/**
+ * One virtual user: try/catch around the query, return outcome (never throws).
+ * @param {() => Promise<void>} queryFn
+ */
+async function runOneUserQuery(queryFn) {
+  try {
+    await queryFn();
+    return { ok: true, category: null };
+  } catch (err) {
+    return { ok: false, category: categorizeError(err), error: String(err?.message || err) };
+  }
+}
+
+/**
+ * @param {number} concurrency
+ * @param {() => Promise<void>} queryFn
+ */
+async function runBatchWithAllSettled(concurrency, queryFn) {
+  const wallStart = performance.now();
+  const userPromises = Array.from({ length: concurrency }, () => runOneUserQuery(queryFn));
+  const settled = await Promise.allSettled(userPromises);
+  const wallEnd = performance.now();
+
+  const outcomes = settled.map((s) => {
+    if (s.status === "fulfilled") return s.value;
+    return { ok: false, category: categorizeError(s.reason), error: String(s.reason?.message || s.reason) };
+  });
+
+  const failures = outcomes.filter((o) => !o.ok);
+  const errorCount = failures.length;
+  const errorRatePercent = concurrency === 0 ? 0 : (errorCount / concurrency) * 100;
+
+  /** @type {Record<string, number>} */
+  const categoryCounts = { Timeout: 0, Deadlock: 0, "Connection Refused": 0, Other: 0 };
+  for (const f of failures) {
+    if (f.category && categoryCounts[f.category] !== undefined) {
+      categoryCounts[f.category] += 1;
+    } else {
+      categoryCounts.Other += 1;
+    }
+  }
+
+  return {
+    concurrency,
+    wallTimeMs: wallEnd - wallStart,
+    successCount: concurrency - errorCount,
+    errorCount,
+    errorRatePercent: Number(errorRatePercent.toFixed(4)),
+    categoryCounts,
+  };
+}
+
+async function main() {
+  const datasetName = getArgValue("--dataset", "");
+  const pgTable = getArgValue("--pg-table", datasetName ? sanitizeResourceName(datasetName, "dataset") : "");
+  const mongoCollectionName = getArgValue(
+    "--mongo-collection",
+    datasetName ? sanitizeResourceName(datasetName, "dataset") : "",
+  );
+
+  if (!pgTable || !mongoCollectionName) {
+    console.error(
+      "Missing dataset mapping. Provide either:\n" +
+        '  --dataset "<CSV base name used in index.js>"\n' +
+        "or:\n" +
+        '  --pg-table "<postgres table>" --mongo-collection "<mongo collection>"',
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  const pgPool = new Pool(CONFIG.postgres);
+  const mongoUri = `mongodb://${CONFIG.mongo.host}:${CONFIG.mongo.port}`;
+  const mongoClient = new MongoClient(mongoUri, {
+    maxPoolSize: Number(process.env.MONGO_POOL_MAX || 20),
+    serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 10_000),
+  });
+
+  await mongoClient.connect();
+  const mongoDb = mongoClient.db(CONFIG.mongo.db);
+  const mongoCollection = mongoDb.collection(mongoCollectionName);
+
+  /** @type {typeof STRESS_LADDER[number] | null} */
+  let pgFirstErrorConcurrency = null;
+  /** @type {typeof STRESS_LADDER[number] | null} */
+  let mongoFirstErrorConcurrency = null;
+  /** @type {typeof STRESS_LADDER[number] | null} */
+  let pgFirstDegradationConcurrency = null;
+  /** @type {typeof STRESS_LADDER[number] | null} */
+  let mongoFirstDegradationConcurrency = null;
+
+  const pgBatches = [];
+  const mongoBatches = [];
+
+  try {
+    for (const concurrency of STRESS_LADDER) {
+      const pgBatch = await runBatchWithAllSettled(concurrency, async () => {
+        const sql = `SELECT * FROM ${quotePgIdent(pgTable)};`;
+        await pgPool.query(sql);
+      });
+      pgBatches.push(pgBatch);
+      if (pgBatch.errorCount > 0 && pgFirstErrorConcurrency === null) {
+        pgFirstErrorConcurrency = concurrency;
+      }
+      if (pgBatch.errorRatePercent > DEGRADATION_THRESHOLD_PERCENT && pgFirstDegradationConcurrency === null) {
+        pgFirstDegradationConcurrency = concurrency;
+      }
+
+      const mongoBatch = await runBatchWithAllSettled(concurrency, async () => {
+        await mongoCollection.find({}).toArray();
+      });
+      mongoBatches.push(mongoBatch);
+      if (mongoBatch.errorCount > 0 && mongoFirstErrorConcurrency === null) {
+        mongoFirstErrorConcurrency = concurrency;
+      }
+      if (
+        mongoBatch.errorRatePercent > DEGRADATION_THRESHOLD_PERCENT &&
+        mongoFirstDegradationConcurrency === null
+      ) {
+        mongoFirstDegradationConcurrency = concurrency;
+      }
+
+      console.log(
+        `[Concurrency ${concurrency}] Postgres error rate: ${pgBatch.errorRatePercent}% | Mongo error rate: ${mongoBatch.errorRatePercent}%`,
+      );
+    }
+  } finally {
+    await pgPool.end().catch(() => {});
+    await mongoClient.close().catch(() => {});
+  }
+
+  const report = {
+    generatedAt: new Date().toISOString(),
+    researchQuestion:
+      "Reliability thresholds: concurrency at first error and at >1% error rate",
+    env: {
+      pgHost: CONFIG.postgres.host,
+      mongoHost: CONFIG.mongo.host,
+    },
+    stressLadder: [...STRESS_LADDER],
+    degradationThresholdPercent: DEGRADATION_THRESHOLD_PERCENT,
+    postgres: {
+      table: pgTable,
+      firstErrorAtConcurrency: pgFirstErrorConcurrency,
+      firstDegradationAtConcurrency: pgFirstDegradationConcurrency,
+      batches: pgBatches,
+    },
+    mongodb: {
+      collection: mongoCollectionName,
+      firstErrorAtConcurrency: mongoFirstErrorConcurrency,
+      firstDegradationAtConcurrency: mongoFirstDegradationConcurrency,
+      batches: mongoBatches,
+    },
+  };
+
+  fs.writeFileSync(REPORT_PATH, JSON.stringify(report, null, 2), "utf8");
+  console.log(`Wrote ${REPORT_PATH}`);
+}
+
+main().catch((err) => {
+  console.error("Fatal error:", err?.stack || err);
+  process.exitCode = 1;
+});
+
+
+// query_benchmark.js – Multiple CRUD & Analytical Query Suite
+
+const fs = require("fs");
+const path = require("path");
+const { performance } = require("perf_hooks");
+const { Pool } = require("pg");
+const { MongoClient } = require("mongodb");
+
+// Reuse the CONFIG object from your existing insertion benchmark.
+const { CONFIG } = require("./index.js");
+
+function getArgValue(flagName, defaultValue) {
+  // Supports:
+  //   --flag=value
+  //   --flag value
+  const argv = process.argv.slice(2);
+  const asEq = argv.find((a) => a.startsWith(`${flagName}=`));
+  if (asEq) return asEq.slice(flagName.length + 1);
+  const idx = argv.indexOf(flagName);
+  if (idx !== -1 && idx + 1 < argv.length) return argv[idx + 1];
+  return defaultValue;
+}
+
+function escapeCsv(value) {
+  const s = value === null || value === undefined ? "" : String(value);
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function quotePgIdent(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
+function sanitizeIdentifier(value, fallbackPrefix) {
+  const lower = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const withFallback = lower || fallbackPrefix;
+  if (/^[0-9]/.test(withFallback)) return `${fallbackPrefix}_${withFallback}`;
+  return withFallback;
+}
+
+function sanitizeResourceName(name, fallbackPrefix) {
+  return sanitizeIdentifier(name, fallbackPrefix);
+}
+
+function sanitizePostgresColumnNameFromHeader(header) {
+  // index.js uses sanitizePostgresColumnName(header, index), which falls back to
+  // col_{index+1} only if the sanitized header becomes empty.
+  // In practice, for well-formed column headers (like "Total Profit"),
+  // the sanitized form is stable (e.g., total_profit).
+  return sanitizeIdentifier(header, "col");
+}
+
+function numericTextToPgDoubleExpr(pgColumnIdent) {
+  // Why: index.js stores numeric-like values as TEXT. For fair filtering/SUM,
+  // we convert TEXT to numeric inside the SQL query.
+  // - regexp_replace strips currency symbols and thousands separators.
+  // - NULLIF(...,'') prevents errors on empty strings.
+  const cleaned = `regexp_replace(${pgColumnIdent}, '[^0-9\\.-]', '', 'g')`;
+  return `NULLIF(${cleaned}, '')::numeric`;
+}
+
+function buildMongoConvertToDoubleExpr(fieldPath) {
+  // Why: MongoDB comparisons/SUM need numeric coercion when source values
+  // are stored as strings (which matches index.js behavior).
+  return {
+    $convert: {
+      input: fieldPath,
+      to: "double",
+      onError: null,
+      onNull: null,
+    },
+  };
+}
+
+async function withTimeout(promise, timeoutMs) {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function runConcurrentUsers(concurrency, taskFactory) {
+  const tasks = [];
+  for (let userId = 1; userId <= concurrency; userId++) {
+    tasks.push(
+      (async () => {
+        const execStart = performance.now();
+        await taskFactory(userId);
+        const execEnd = performance.now();
+        // Why: timestamp should reflect when the measured work completes,
+        // so it aligns better with ExecutionTimeMS in logs and CSV.
+        const finished = new Date().toISOString();
+        return { execMs: execEnd - execStart, timestamp: finished };
+      })(),
+    );
+  }
+  return Promise.all(tasks);
+}
+
+function appendCsvRows(reportPath, rows) {
+  // rows: [{ QueryType, Database, ExecutionTimeMS, Timestamp }]
+  const lines = rows
+    .map(
+      (r) =>
+        [r.QueryType, r.Database, r.ExecutionTimeMS, r.Timestamp].map(escapeCsv).join(",") + "\n",
+    )
+    .join("");
+  fs.appendFileSync(reportPath, lines, "utf8");
+}
+
+function initReport(reportPath) {
+  const header = ["QueryType", "Database", "ExecutionTimeMS", "Timestamp"].join(",") + "\n";
+  fs.writeFileSync(reportPath, header, "utf8");
+}
+
+async function createPostgresPool(pgConfig) {
+  return new Pool(pgConfig);
+}
+
+async function createMongoClientAndCollection({ mongoConfig, dbName, collectionName }) {
+  const mongoUri = `mongodb://${mongoConfig.host}:${mongoConfig.port}`;
+  const mongoClient = new MongoClient(mongoUri, {
+    maxPoolSize: Number(process.env.MONGO_POOL_MAX || 20),
+    serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 10_000),
+  });
+  await mongoClient.connect();
+  const mongoDb = mongoClient.db(dbName);
+  const mongoCollection = mongoDb.collection(collectionName);
+  return { mongoClient, mongoCollection };
+}
+
+async function runSelectAllPostgres({ pool, pgTable, queryTimeoutMs }) {
+  const sql = `SELECT * FROM ${quotePgIdent(pgTable)};`;
+  await withTimeout(pool.query(sql), queryTimeoutMs);
+}
+
+async function runSelectAllMongo({ mongoCollection, queryTimeoutMs }) {
+  // Why: SELECT * / find() are intentionally included to reflect end-to-end
+  // read + result transfer costs, not just index lookup time.
+  await withTimeout(mongoCollection.find({}).toArray(), queryTimeoutMs);
+}
+
+async function runComplexFilterPostgres({
+  pool,
+  pgTable,
+  pgTotalProfitColumn,
+  pgRegionColumn,
+  profitThreshold,
+  regionValue,
+  queryTimeoutMs,
+}) {
+  const totalProfitIdent = quotePgIdent(pgTotalProfitColumn);
+  const regionIdent = quotePgIdent(pgRegionColumn);
+  const profitNumExpr = numericTextToPgDoubleExpr(totalProfitIdent);
+
+  const sql = `SELECT * FROM ${quotePgIdent(pgTable)}
+WHERE ${profitNumExpr} > $1 AND ${regionIdent} = $2;`;
+
+  await withTimeout(pool.query(sql, [profitThreshold, regionValue]), queryTimeoutMs);
+}
+
+async function runComplexFilterMongo({
+  mongoCollection,
+  profitField,
+  regionField,
+  profitThreshold,
+  regionValue,
+  queryTimeoutMs,
+}) {
+  const profitPath = `$${profitField}`;
+  const regionPath = `$${regionField}`;
+
+  const filter = {
+    // Why: $expr lets MongoDB evaluate an expression-based numeric comparison
+    // at query time (required because index.js stores values as strings).
+    $expr: {
+      $and: [
+        { $gt: [buildMongoConvertToDoubleExpr(profitPath), profitThreshold] },
+        { $eq: [regionPath, regionValue] },
+      ],
+    },
+  };
+
+  await withTimeout(mongoCollection.find(filter).toArray(), queryTimeoutMs);
+}
+
+async function runAggregationPostgres({
+  pool,
+  pgTable,
+  pgCategoryColumn,
+  pgSumColumn,
+  queryTimeoutMs,
+}) {
+  const categoryIdent = quotePgIdent(pgCategoryColumn);
+  const sumIdent = quotePgIdent(pgSumColumn);
+  const sumNumExpr = numericTextToPgDoubleExpr(sumIdent);
+
+  const sql = `SELECT ${categoryIdent} AS category, SUM(${sumNumExpr}) AS total_sum
+FROM ${quotePgIdent(pgTable)}
+GROUP BY ${categoryIdent};`;
+
+  await withTimeout(pool.query(sql), queryTimeoutMs);
+}
+
+async function runAggregationMongo({
+  mongoCollection,
+  categoryField,
+  sumField,
+  queryTimeoutMs,
+}) {
+  // Why: GROUP BY + SUM is a classic comparison point for relational optimizers
+  // vs Mongo's aggregation execution engine.
+  const pipeline = [
+    {
+      $group: {
+        _id: `$${categoryField}`,
+        total_sum: {
+          $sum: {
+            $convert: {
+              input: `$${sumField}`,
+              to: "double",
+              onError: 0,
+              onNull: 0,
+            },
+          },
+        },
+      },
+    },
+  ];
+
+  await withTimeout(mongoCollection.aggregate(pipeline, { allowDiskUse: true }).toArray(), queryTimeoutMs);
+}
+
+async function main() {
+  const concurrency = Number(getArgValue("--concurrency", 5));
+  const roundsColdWarm = Number(getArgValue("--coldwarm-rounds", 10));
+  const selectAllQueryTimeoutMs = Number(getArgValue("--selectall-timeout-ms", 60_000));
+  const complexFilterQueryTimeoutMs = Number(getArgValue("--complex-timeout-ms", 60_000));
+  const aggregationQueryTimeoutMs = Number(getArgValue("--agg-timeout-ms", 60_000));
+
+  const datasetName = getArgValue("--dataset", "");
+  const pgTable = getArgValue("--pg-table", datasetName ? sanitizeResourceName(datasetName, "dataset") : "");
+  const mongoCollection = getArgValue(
+    "--mongo-collection",
+    datasetName ? sanitizeResourceName(datasetName, "dataset") : "",
+  );
+
+  if (!pgTable || !mongoCollection) {
+    console.error(
+      "Missing dataset mapping. Provide either:\n" +
+        "  --dataset \"<CSV base name used in index.js>\" \n" +
+        "or:\n" +
+        "  --pg-table \"<postgres table name>\" --mongo-collection \"<mongo collection name>\"",
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  // Column headers as they appeared in the original CSV.
+  const totalProfitColumnHeader = getArgValue("--total-profit-column", "Total Profit");
+  const regionColumnHeader = getArgValue("--region-column", "Region");
+  const totalRevenueColumnHeader = getArgValue("--total-revenue-column", "Total Revenue");
+  const itemTypeColumnHeader = getArgValue("--item-type-column", "Item Type");
+
+  const profitThreshold = Number(getArgValue("--profit-threshold", 5000));
+  const regionValue = getArgValue("--region-value", "Europe");
+
+  const reportPath = getArgValue(
+    "--report",
+    path.resolve(process.cwd(), "query_performance_report.csv"),
+  );
+  initReport(reportPath);
+
+  const pgTotalProfitColumn = sanitizePostgresColumnNameFromHeader(totalProfitColumnHeader);
+  const pgRegionColumn = sanitizePostgresColumnNameFromHeader(regionColumnHeader);
+  const pgSumRevenueColumn = sanitizePostgresColumnNameFromHeader(totalRevenueColumnHeader);
+  const pgCategoryColumn = sanitizePostgresColumnNameFromHeader(itemTypeColumnHeader);
+
+  const mongoProfitField = totalProfitColumnHeader; // Mongo uses original header keys
+  const mongoRegionField = regionColumnHeader;
+  const mongoSumField = totalRevenueColumnHeader;
+  const mongoCategoryField = itemTypeColumnHeader;
+
+  console.log(`Starting query benchmark with concurrency=${concurrency}`);
+  console.log(`PostgreSQL table: ${pgTable}`);
+  console.log(`MongoDB collection: ${mongoCollection}`);
+  console.log(`Report: ${reportPath}`);
+
+  // Shared clients for warm-state rounds.
+  const poolWarm = await createPostgresPool(CONFIG.postgres);
+  const { mongoClient: mongoWarmClient, mongoCollection: mongoWarmCollection } =
+    await createMongoClientAndCollection({
+      mongoConfig: CONFIG.mongo,
+      dbName: CONFIG.mongo.db,
+      collectionName: mongoCollection,
+    });
+
+  const databaseRows = [];
+
+  async function recordConcurrentExecution({
+    QueryType,
+    Database,
+    concurrency,
+    taskFactory,
+    queryTimeoutMs,
+  }) {
+    const results = await runConcurrentUsers(concurrency, async (userId) => {
+      // Note: userId is currently unused in the queries; it exists to preserve
+      // the "simultaneous users" model for contention experiments.
+      await taskFactory(userId);
+    });
+
+    for (const r of results) {
+      databaseRows.push({
+        QueryType,
+        Database,
+        ExecutionTimeMS: r.execMs.toFixed(3),
+        Timestamp: r.timestamp,
+      });
+    }
+    // Ensure all queued lines are persisted after each test stage.
+    appendCsvRows(reportPath, databaseRows.splice(0, databaseRows.length));
+  }
+
+  // ----------------------------
+  // 1) Cold vs Warm Cache
+  // ----------------------------
+  const coldWarmQueryType = "ColdVsWarm_SelectAll";
+  console.log(`Running Cold vs Warm Cache test (${roundsColdWarm} rounds)...`);
+
+  const coldWarmTimes = {
+    Postgres: [],
+    MongoDB: [],
+  };
+
+  for (let round = 1; round <= roundsColdWarm; round++) {
+    const isColdRound = round === 1;
+    const QueryType = coldWarmQueryType; // database column disambiguates
+
+    if (isColdRound) {
+      // Why: create fresh clients so that per-connection state is not reused.
+      // This is a best-effort approximation of "cold" conditions.
+      const coldPool = await createPostgresPool(CONFIG.postgres);
+      const { mongoClient: coldMongoClient, mongoCollection: coldMongoCollection } =
+        await createMongoClientAndCollection({
+          mongoConfig: CONFIG.mongo,
+          dbName: CONFIG.mongo.db,
+          collectionName: mongoCollection,
+        });
+
+      await recordConcurrentExecution({
+        QueryType,
+        Database: "Postgres",
+        concurrency,
+        queryTimeoutMs: selectAllQueryTimeoutMs,
+        taskFactory: () => runSelectAllPostgres({ pool: coldPool, pgTable, queryTimeoutMs: selectAllQueryTimeoutMs }),
+      });
+
+      await recordConcurrentExecution({
+        QueryType,
+        Database: "MongoDB",
+        concurrency,
+        queryTimeoutMs: selectAllQueryTimeoutMs,
+        taskFactory: () => runSelectAllMongo({ mongoCollection: coldMongoCollection, queryTimeoutMs: selectAllQueryTimeoutMs }),
+      });
+
+      await coldPool.end();
+      await coldMongoClient.close();
+    } else {
+      await recordConcurrentExecution({
+        QueryType,
+        Database: "Postgres",
+        concurrency,
+        queryTimeoutMs: selectAllQueryTimeoutMs,
+        taskFactory: () => runSelectAllPostgres({ pool: poolWarm, pgTable, queryTimeoutMs: selectAllQueryTimeoutMs }),
+      });
+
+      await recordConcurrentExecution({
+        QueryType,
+        Database: "MongoDB",
+        concurrency,
+        queryTimeoutMs: selectAllQueryTimeoutMs,
+        taskFactory: () => runSelectAllMongo({ mongoCollection: mongoWarmCollection, queryTimeoutMs: selectAllQueryTimeoutMs }),
+      });
+    }
+  }
+
+  // Compute FirstRun vs WarmAvg (rounds 2..N).
+  // We reconstruct times from the CSV we just wrote by re-running queries here would be redundant.
+  // Instead, compute from the recorded rows in-memory:
+  // However, recordConcurrentExecution currently flushes rows to disk and doesn't keep them.
+  // For correctness, read back from the file for summarization.
+  //
+  // Why read-back: keeps the "output requirement" simple and ensures summary uses the
+  // exact persisted values.
+  const reportLines = fs.readFileSync(reportPath, "utf8").trim().split("\n");
+  // header at 0
+  const coldWarmRows = reportLines
+    .slice(1)
+    .map((l) => {
+      const parts = l.split(",");
+      return {
+        QueryType: parts[0],
+        Database: parts[1],
+        ExecutionTimeMS: Number(parts[2]),
+      };
+    })
+    .filter((r) => r.QueryType === coldWarmQueryType);
+
+  const byDb = { Postgres: [], MongoDB: [] };
+  for (const r of coldWarmRows) {
+    if (!Number.isFinite(r.ExecutionTimeMS)) continue;
+    byDb[r.Database].push(r.ExecutionTimeMS);
+  }
+
+  // For dissertation reporting: interpret the earliest round as cold, and remaining as warm.
+  // Since we appended round-by-round, the first `concurrency` entries per DB correspond to round 1.
+  const firstChunkSize = concurrency; // per round, 5 users
+  const summaryNow = new Date().toISOString();
+
+  for (const dbName of Object.keys(byDb)) {
+    const times = byDb[dbName];
+    const firstTimes = times.slice(0, firstChunkSize);
+    const warmTimes = times.slice(firstChunkSize); // rounds 2..N across all users
+    const firstAvg = firstTimes.reduce((a, b) => a + b, 0) / Math.max(1, firstTimes.length);
+    const warmAvg = warmTimes.reduce((a, b) => a + b, 0) / Math.max(1, warmTimes.length);
+
+    appendCsvRows(reportPath, [
+      {
+        QueryType: "ColdVsWarm_FirstRunAvg",
+        Database: dbName,
+        ExecutionTimeMS: firstAvg.toFixed(3),
+        Timestamp: summaryNow,
+      },
+      {
+        QueryType: "ColdVsWarm_WarmAvg_2toN",
+        Database: dbName,
+        ExecutionTimeMS: warmAvg.toFixed(3),
+        Timestamp: summaryNow,
+      },
+    ]);
+
+    console.log(
+      `${dbName}: FirstRunAvg=${firstAvg.toFixed(3)} ms, WarmAvg=${warmAvg.toFixed(3)} ms (rounds 2..${roundsColdWarm})`,
+    );
+  }
+
+  // ----------------------------
+  // 2) Complex Filtering
+  // ----------------------------
+  console.log("Running complex filtering scalability test...");
+  await recordConcurrentExecution({
+    QueryType: "ComplexFiltering_TotalProfit_Region",
+    Database: "Postgres",
+    concurrency,
+    queryTimeoutMs: complexFilterQueryTimeoutMs,
+    taskFactory: () =>
+      runComplexFilterPostgres({
+        pool: poolWarm,
+        pgTable,
+        pgTotalProfitColumn,
+        pgRegionColumn,
+        profitThreshold,
+        regionValue,
+        queryTimeoutMs: complexFilterQueryTimeoutMs,
+      }),
+  });
+  await recordConcurrentExecution({
+    QueryType: "ComplexFiltering_TotalProfit_Region",
+    Database: "MongoDB",
+    concurrency,
+    queryTimeoutMs: complexFilterQueryTimeoutMs,
+    taskFactory: () =>
+      runComplexFilterMongo({
+        mongoCollection: mongoWarmCollection,
+        profitField: mongoProfitField,
+        regionField: mongoRegionField,
+        profitThreshold,
+        regionValue,
+        queryTimeoutMs: complexFilterQueryTimeoutMs,
+      }),
+  });
+
+  // ----------------------------
+  // 3) Aggregation Benchmark
+  // ----------------------------
+  console.log("Running aggregation benchmark (SUM grouped by category)...");
+  await recordConcurrentExecution({
+    QueryType: "Aggregation_SumRevenue_GroupByCategory",
+    Database: "Postgres",
+    concurrency,
+    queryTimeoutMs: aggregationQueryTimeoutMs,
+    taskFactory: () =>
+      runAggregationPostgres({
+        pool: poolWarm,
+        pgTable,
+        pgCategoryColumn,
+        pgSumColumn: pgSumRevenueColumn,
+        queryTimeoutMs: aggregationQueryTimeoutMs,
+      }),
+  });
+  await recordConcurrentExecution({
+    QueryType: "Aggregation_SumRevenue_GroupByCategory",
+    Database: "MongoDB",
+    concurrency,
+    queryTimeoutMs: aggregationQueryTimeoutMs,
+    taskFactory: () =>
+      runAggregationMongo({
+        mongoCollection: mongoWarmCollection,
+        categoryField: mongoCategoryField,
+        sumField: mongoSumField,
+        queryTimeoutMs: aggregationQueryTimeoutMs,
+      }),
+  });
+
+  // Clean up warm clients.
+  await poolWarm.end();
+  await mongoWarmClient.close();
+
+  console.log("Benchmark complete. CSV report generated.");
+  console.log(`Final report: ${reportPath}`);
+}
+
+main().catch((err) => {
+  console.error("Fatal error:", err?.stack || err);
+  process.exitCode = 1;
+});
+
+// scaling_analysis.js – Latency Distribution & Predictability
+
+const fs = require("fs");
+const path = require("path");
+const { performance } = require("perf_hooks");
+const { Pool } = require("pg");
+const { MongoClient } = require("mongodb");
+
+require("dotenv").config({ path: path.resolve(process.cwd(), ".env") });
+const { CONFIG } = require("./index.js");
+
+const BATCH_OPS = 5000;
+const MIN_CONCURRENT = 100;
+const MAX_CONCURRENT = 500;
+const DEFAULT_CONCURRENT = 300;
+const OUT_DEFAULT = path.resolve(process.cwd(), "scaling_predictability.csv");
+
+function getArgValue(flagName, defaultValue) {
+  const argv = process.argv.slice(2);
+  const asEq = argv.find((a) => a.startsWith(`${flagName}=`));
+  if (asEq) return asEq.slice(flagName.length + 1);
+  const idx = argv.indexOf(flagName);
+  if (idx !== -1 && idx + 1 < argv.length) return argv[idx + 1];
+  return defaultValue;
+}
+
+function sanitizeIdentifier(value, fallbackPrefix) {
+  const lower = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const withFallback = lower || fallbackPrefix;
+  if (/^[0-9]/.test(withFallback)) return `${fallbackPrefix}_${withFallback}`;
+  return withFallback;
+}
+
+function sanitizeResourceName(name, fallbackPrefix) {
+  return sanitizeIdentifier(name, fallbackPrefix);
+}
+
+function quotePgIdent(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
+function escapeCsv(value) {
+  const s = value === null || value === undefined ? "" : String(value);
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function clampConcurrent(n) {
+  if (Number.isNaN(n) || n < MIN_CONCURRENT) return MIN_CONCURRENT;
+  if (n > MAX_CONCURRENT) return MAX_CONCURRENT;
+  return n;
+}
+
+function mean(arr) {
+  if (!arr.length) return NaN;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+/** Sample standard deviation (Bessel's correction). */
+function stdDevSample(arr) {
+  if (arr.length < 2) return 0;
+  const m = mean(arr);
+  const ss = arr.reduce((s, x) => s + (x - m) ** 2, 0);
+  return Math.sqrt(ss / (arr.length - 1));
+}
+
+/** P99: nearest-rank percentile on sorted ascending latencies (ms). */
+function p99LatencySortedAsc(sorted) {
+  const n = sorted.length;
+  if (n === 0) return NaN;
+  const k = Math.ceil(0.99 * n) - 1;
+  return sorted[Math.min(n - 1, Math.max(0, k))];
+}
+
+function summarizeLatencies(latenciesMs) {
+  const sorted = [...latenciesMs].sort((a, b) => a - b);
+  const m = mean(latenciesMs);
+  const sd = stdDevSample(latenciesMs);
+  const p99 = p99LatencySortedAsc(sorted);
+  const predictability = p99 > 0 ? m / p99 : NaN;
+  return { mean: m, stdDev: sd, p99, predictability };
+}
+
+/**
+ * Strictly sequential: one op after another.
+ * @param {number} count
+ * @param {() => Promise<void>} opFn
+ */
+async function runSequentialBatch(count, opFn) {
+  const latencies = [];
+  for (let i = 0; i < count; i += 1) {
+    const t0 = performance.now();
+    await opFn();
+    latencies.push(performance.now() - t0);
+  }
+  return latencies;
+}
+
+/**
+ * High-demand: `concurrency` workers each run ops until `count` total complete (interleaved I/O).
+ * @param {number} count
+ * @param {number} concurrency
+ * @param {() => Promise<void>} opFn
+ */
+async function runConcurrentCeilingBatch(count, concurrency, opFn) {
+  /** @type {number[]} */
+  const latencies = [];
+  let next = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = next;
+      next += 1;
+      if (idx >= count) return;
+      const t0 = performance.now();
+      await opFn();
+      latencies.push(performance.now() - t0);
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  return latencies;
+}
+
+function writeCsv(outPath, rows) {
+  const header =
+    ["DB_Type", "Mode", "Mean", "StdDev", "P99", "PredictabilityScore"].join(",") + "\n";
+  const lines = rows.map((r) =>
+    [
+      r.DB_Type,
+      r.Mode,
+      r.Mean,
+      r.StdDev,
+      r.P99,
+      r.PredictabilityScore,
+    ]
+      .map(escapeCsv)
+      .join(","),
+  );
+  fs.writeFileSync(outPath, header + lines.join("\n") + "\n", "utf8");
+}
+
+async function main() {
+  const datasetName = getArgValue("--dataset", "");
+  const pgTable = getArgValue("--pg-table", datasetName ? sanitizeResourceName(datasetName, "dataset") : "");
+  const mongoCollectionName = getArgValue(
+    "--mongo-collection",
+    datasetName ? sanitizeResourceName(datasetName, "dataset") : "",
+  );
+
+  if (!pgTable || !mongoCollectionName) {
+    console.error(
+      "Missing dataset mapping. Provide either:\n" +
+        '  --dataset "<CSV base name used in index.js>"\n' +
+        "or:\n" +
+        '  --pg-table "<postgres table>" --mongo-collection "<mongo collection>"',
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  const concurrentRaw = Number(
+    getArgValue("--concurrent-users", process.env.SCALING_CONCURRENT_USERS || String(DEFAULT_CONCURRENT)),
+  );
+  const concurrentUsers = clampConcurrent(concurrentRaw);
+
+  if (concurrentRaw !== concurrentUsers) {
+    console.warn(
+      `Concurrent users ${concurrentRaw} clamped to ceiling band [${MIN_CONCURRENT}, ${MAX_CONCURRENT}] -> ${concurrentUsers}`,
+    );
+  }
+
+  const outPath = path.resolve(process.cwd(), getArgValue("--out", OUT_DEFAULT));
+
+  const pgPool = new Pool({
+    ...CONFIG.postgres,
+    max: Math.max(Number(CONFIG.postgres.max || 10), concurrentUsers),
+  });
+  const mongoUri = `mongodb://${CONFIG.mongo.host}:${CONFIG.mongo.port}`;
+  const mongoClient = new MongoClient(mongoUri, {
+    maxPoolSize: Math.max(Number(process.env.MONGO_POOL_MAX || 20), concurrentUsers),
+    serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 10_000),
+  });
+
+  await mongoClient.connect();
+  const mongoDb = mongoClient.db(CONFIG.mongo.db);
+  const mongoCollection = mongoDb.collection(mongoCollectionName);
+
+  const pgQuery = async () => {
+    const sql = `SELECT * FROM ${quotePgIdent(pgTable)};`;
+    await pgPool.query(sql);
+  };
+
+  const mongoQuery = async () => {
+    await mongoCollection.find({}).toArray();
+  };
+
+  /** @type {Array<{DB_Type: string, Mode: string, Mean: string, StdDev: string, P99: string, PredictabilityScore: string}>} */
+  const rows = [];
+
+  try {
+    console.log(
+      `Single-Node (sequential): ${BATCH_OPS} ops each | High-Demand: ${BATCH_OPS} ops, concurrency=${concurrentUsers}`,
+    );
+
+    for (const { label, dbType, opFn } of [
+      { label: "Postgres", dbType: "Postgres", opFn: pgQuery },
+      { label: "MongoDB", dbType: "MongoDB", opFn: mongoQuery },
+    ]) {
+      console.log(`[${label}] Single-Node batch...`);
+      const seqLat = await runSequentialBatch(BATCH_OPS, opFn);
+      const seq = summarizeLatencies(seqLat);
+      rows.push({
+        DB_Type: dbType,
+        Mode: "Single-Node",
+        Mean: seq.mean.toFixed(6),
+        StdDev: seq.stdDev.toFixed(6),
+        P99: seq.p99.toFixed(6),
+        PredictabilityScore: seq.predictability.toFixed(6),
+      });
+
+      console.log(`[${label}] High-Demand batch...`);
+      const concLat = await runConcurrentCeilingBatch(BATCH_OPS, concurrentUsers, opFn);
+      const conc = summarizeLatencies(concLat);
+      rows.push({
+        DB_Type: dbType,
+        Mode: "High-Demand",
+        Mean: conc.mean.toFixed(6),
+        StdDev: conc.stdDev.toFixed(6),
+        P99: conc.p99.toFixed(6),
+        PredictabilityScore: conc.predictability.toFixed(6),
+      });
+    }
+  } finally {
+    await pgPool.end().catch(() => {});
+    await mongoClient.close().catch(() => {});
+  }
+
+  writeCsv(outPath, rows);
+  console.table(
+    rows.map((r) => ({
+      DB_Type: r.DB_Type,
+      Mode: r.Mode,
+      Mean_ms: r.Mean,
+      StdDev_ms: r.StdDev,
+      P99_ms: r.P99,
+      Predictability: r.PredictabilityScore,
+    })),
+  );
+  console.log(`Wrote ${outPath}`);
+}
+
+main().catch((err) => {
+  console.error("Fatal error:", err?.stack || err);
+  process.exitCode = 1;
+});
+
+
+// load_test.js – Step-Load Concurrency & Saturation
+
+const fs = require("fs");
+const path = require("path");
+const { performance } = require("perf_hooks");
+const { Pool } = require("pg");
+const { MongoClient } = require("mongodb");
+const { CONFIG } = require("./index.js");
+
+function getArgValue(flagName, defaultValue) {
+  const argv = process.argv.slice(2);
+  const asEq = argv.find((a) => a.startsWith(`${flagName}=`));
+  if (asEq) return asEq.slice(flagName.length + 1);
+  const idx = argv.indexOf(flagName);
+  if (idx !== -1 && idx + 1 < argv.length) return argv[idx + 1];
+  return defaultValue;
+}
+
+function sanitizeIdentifier(value, fallbackPrefix) {
+  const lower = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const withFallback = lower || fallbackPrefix;
+  if (/^[0-9]/.test(withFallback)) return `${fallbackPrefix}_${withFallback}`;
+  return withFallback;
+}
+
+function sanitizeResourceName(name, fallbackPrefix) {
+  return sanitizeIdentifier(name, fallbackPrefix);
+}
+
+function quotePgIdent(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
+function escapeCsv(value) {
+  const s = value === null || value === undefined ? "" : String(value);
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function ensureCsvHeader(csvPath) {
+  if (fs.existsSync(csvPath)) return;
+  const header = [
+    "Timestamp",
+    "Users",
+    "DB",
+    "TotalWallTimeMS",
+    "ThroughputOpsPerSec",
+    "AvgLatencyMS",
+  ].join(",") + "\n";
+  fs.writeFileSync(csvPath, header, "utf8");
+}
+
+function appendCsvRow(csvPath, row) {
+  const line =
+    [
+      row.Timestamp,
+      row.Users,
+      row.DB,
+      row.TotalWallTimeMS,
+      row.ThroughputOpsPerSec,
+      row.AvgLatencyMS,
+    ]
+      .map(escapeCsv)
+      .join(",") + "\n";
+  fs.appendFileSync(csvPath, line, "utf8");
+}
+
+/**
+ * Simulate `userCount` concurrent virtual users with Promise.all.
+ * Why this matters: Promise.all launches all tasks immediately from the app layer,
+ * creating a consistent and reproducible contention pattern for concurrency analysis.
+ */
+async function runParallelTest(userCount, queryFn) {
+  const wallStart = performance.now();
+
+  const userTasks = Array.from({ length: userCount }, async () => {
+    const t0 = performance.now();
+    await queryFn();
+    const t1 = performance.now();
+    return t1 - t0;
+  });
+
+  const individualLatencies = await Promise.all(userTasks);
+  const wallEnd = performance.now();
+
+  const totalWallTimeMs = wallEnd - wallStart;
+  const totalWallTimeSec = totalWallTimeMs / 1000;
+  const sumLatencyMs = individualLatencies.reduce((a, b) => a + b, 0);
+  const avgLatencyMs = sumLatencyMs / userCount;
+  const throughputOpsPerSec = userCount / totalWallTimeSec;
+
+  return {
+    totalWallTimeMs,
+    throughputOpsPerSec,
+    avgLatencyMs,
+  };
+}
+
+async function main() {
+  const datasetName = getArgValue("--dataset", "");
+  const pgTable = getArgValue("--pg-table", datasetName ? sanitizeResourceName(datasetName, "dataset") : "");
+  const mongoCollectionName = getArgValue(
+    "--mongo-collection",
+    datasetName ? sanitizeResourceName(datasetName, "dataset") : "",
+  );
+
+  if (!pgTable || !mongoCollectionName) {
+    console.error(
+      "Missing dataset mapping. Provide either:\n" +
+        "  --dataset \"<CSV base name used in index.js>\"\n" +
+        "or:\n" +
+        "  --pg-table \"<postgres table name>\" --mongo-collection \"<mongo collection name>\"",
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  const csvPath = getArgValue(
+    "--report",
+    path.resolve(process.cwd(), "concurrency_results.csv"),
+  );
+  ensureCsvHeader(csvPath);
+
+  // Fixed test loop as requested.
+  const userCounts = [100, 250, 500, 750, 1000];
+
+  // Reuse existing config to create long-lived clients for the full test.
+  const pgPool = new Pool(CONFIG.postgres);
+  const mongoUri = `mongodb://${CONFIG.mongo.host}:${CONFIG.mongo.port}`;
+  const mongoClient = new MongoClient(mongoUri, {
+    maxPoolSize: Number(process.env.MONGO_POOL_MAX || 20),
+    serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 10_000),
+  });
+
+  await mongoClient.connect();
+  const mongoDb = mongoClient.db(CONFIG.mongo.db);
+  const mongoCollection = mongoDb.collection(mongoCollectionName);
+
+  const rowsForConsole = [];
+
+  async function runAndRecord({ userCount, dbName, queryFn }) {
+    const metrics = await runParallelTest(userCount, queryFn);
+    const row = {
+      Timestamp: new Date().toISOString(),
+      Users: userCount,
+      DB: dbName,
+      TotalWallTimeMS: metrics.totalWallTimeMs.toFixed(3),
+      ThroughputOpsPerSec: metrics.throughputOpsPerSec.toFixed(3),
+      AvgLatencyMS: metrics.avgLatencyMs.toFixed(3),
+    };
+    appendCsvRow(csvPath, row);
+    rowsForConsole.push({
+      Users: row.Users,
+      DB: row.DB,
+      "Throughput (ops/s)": row.ThroughputOpsPerSec,
+      "Avg Latency (ms)": row.AvgLatencyMS,
+    });
+  }
+
+  try {
+    for (const userCount of userCounts) {
+      // Standard read query for PostgreSQL.
+      await runAndRecord({
+        userCount,
+        dbName: "Postgres",
+        queryFn: async () => {
+          const sql = `SELECT * FROM ${quotePgIdent(pgTable)};`;
+          await pgPool.query(sql);
+        },
+      });
+
+      // Standard read query for MongoDB.
+      await runAndRecord({
+        userCount,
+        dbName: "MongoDB",
+        queryFn: async () => {
+          await mongoCollection.find({}).toArray();
+        },
+      });
+    }
+  } finally {
+    await pgPool.end();
+    await mongoClient.close();
+  }
+
+  console.table(rowsForConsole);
+  console.log(`Saved concurrency results to: ${csvPath}`);
+}
+
+main().catch((err) => {
+  console.error("Fatal error:", err?.stack || err);
+  process.exitCode = 1;
+});
+
+
+// graph.R – R-Language Data Visualization & Graph Plotting
+
+# Scatter plot 
+> library(readr)
+> View(benchmark_results)
+> data <- read_csv("benchmark_results.csv")
+> print(colnames(data))
+> install.packages("tidyverse")
+> library(ggplot2)
+> View(data)
+> ggplot(data, aes(x = pg_ms, y = mongo_ms)) +
+  +     geom_point(color = "purple", size = 3, alpha = 0.7) +
+  +     geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") + # 1:1 reference line
+  +     labs(title = "Correlation: PostgreSQL vs MongoDB Time",
+             +          subtitle = "Points above the red line indicate MongoDB was slower",
+             +          x = "PostgreSQL Execution Time (ms)",
+             +          y = "MongoDB Execution Time (ms)") +
+  +     theme_minimal()
+
+
+# Box Plot
+> library(ggplot2)
+> library(dplyr)
+> df <- read.csv("query_performance_report.csv", stringsAsFactors = FALSE)
+> colnames(df) <- trimws(colnames(df))
+> print(colnames(df))
+View(df)
+> plot_data <- df %>% 
+  +     filter(QueryType == "ColdVsWarm_SelectAll")
+> ggplot(plot_data, aes(x = Database, y = ExecutionTimeMS, fill = Database)) +
+  +     geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  +     geom_jitter(width = 0.2, alpha = 0.5, size = 1.5) +
+  +     scale_fill_manual(values = c("Postgres" = "#336791", "MongoDB" = "#47A248")) +
+  +     theme_minimal() +
+  +     labs(
+    +         title = "Query Latency Distribution: PostgreSQL vs MongoDB",
+    +         subtitle = "MSc Dissertation: Distributed Cloud Performance Analysis",
+    +         x = "Database Engine",
+    +         y = "Execution Time (ms)"
+    +     ) +
+  +     theme(legend.position = "none")
+
+

@@ -1,19 +1,3 @@
-/**
- * Concurrency Load Test: PostgreSQL vs MongoDB
- *
- * Research goal:
- * - Measure how each database behaves under increasing concurrent read load.
- *
- * Metrics reported for each userCount:
- * - Total Wall Time (how long all virtual users take together)
- * - Throughput (operations per second)
- * - Average Latency (mean of individual query times)
- *
- * Output:
- * - Console table: Users | DB | Throughput (ops/s) | Avg Latency (ms)
- * - Appended CSV: concurrency_results.csv
- */
-
 const fs = require("fs");
 const path = require("path");
 const { performance } = require("perf_hooks");
