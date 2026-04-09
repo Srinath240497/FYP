@@ -1,3 +1,14 @@
+================================================================================
+UNIVERSITY OF HERTFORDSHIRE - SCHOOL OF PHYSICS, ENGINEERING & COMPUTER SCIENCE
+MSc ADVANCED COMPUTER SCIENCE - FINAL PROJECT (CODE)
+================================================================================
+STUDENT NAME: Srinath Sathiyanarayanan
+STUDENT ID: 24097357
+PROJECT TITLE: A Comparative Performance and Reliability Analysis of SQL vs NoSQL Databases for High Concurrency Web Applications
+DATE: April 2026
+Supervisor Name: Manjinder Kaur	
+================================================================================
+
 // index.js – High Velocity Data Pipeline & Schema Provisioning
 const fs = require("fs");
 const path = require("path");
